@@ -1,16 +1,10 @@
 use std::{
-    fs, io,
+    fs::{self, ReadDir, DirEntry},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-    },
-    time::Instant,
 };
 
 use clap::Parser;
 use regex::Regex;
-
-use rayon::{Scope};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -21,6 +15,9 @@ struct Args {
     #[arg(short, long)]
     recursive: bool,
 
+    #[arg(short, long)]
+    debug: bool,
+
     #[arg(short = 'j', long, default_value_t = false)]
     multi_thread: bool,
 
@@ -28,96 +25,100 @@ struct Args {
     dir: String,
 }
 
-fn process_dir_sp(path: &Path, regex: &Regex, recurse: bool) -> io::Result<(usize, usize)> {
-    let mut count = 0;
-    let mut total = 0;
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            if recurse {
-                let (t, c) = process_dir_sp(&path, &regex, recurse)?;
-                count += c;
-                total += t;
-            }
-        } else {
-            total += 1;
-            if regex.is_match(&path.file_name().unwrap().to_str().unwrap()) {
-                //println!("{}", path.display());
-                count += 1;
-            };
-        }
-    }
-
-    Ok((total, count))
+struct Dir {
+    parent: Option<Box<Dir>>,
+    iter: ReadDir,
 }
 
-fn process_dir_mt_sp(path: &Path, regex: Regex) {
-    let files = Arc::from(Mutex::from(vec![path.to_path_buf()]));
-    let regex = Arc::from(regex);
-    fn process_dir(
-        scope: &Scope,
-        path: PathBuf,
-        files: Arc<Mutex<Vec<PathBuf>>>,
-        regex: Arc<Regex>,
-    ) {
-        let entries = fs::read_dir(path).unwrap();
-        let mut dir_files = vec![];
-
-        for entry in entries {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                let arc = files.clone();
-                let regex = regex.clone();
-                scope.spawn(|s| process_dir(s, path, arc, regex));
-            } else {
-                if regex.is_match(path.to_str().unwrap()) {
-                    dir_files.push(path);
-                }
-            }
+impl Dir {
+    fn from_root(path: &PathBuf) -> Option<Self> {
+        let dir_iter = fs::read_dir(path);
+        match dir_iter {
+            Ok(iter) => Some(Self {
+                parent: None,
+                iter,
+            }),
+            Err(_) => None,
         }
-
-        let mut files = files.lock().unwrap();
-
-        files.append(&mut dir_files);
     }
 
-    let files_clone = files.clone();
-    rayon::scope(|scope| {
-        process_dir(scope, path.to_path_buf(), files_clone, regex);
-    });
-
-    let mutex = Arc::try_unwrap(files).unwrap();
-    let _files = mutex.into_inner().unwrap();
-
-    _files.iter().for_each(|x| {
-        x.to_str().unwrap();
-    });
-    //println!("{} files checked...", files.len());
-    //println!("{} matches found!", files.len());
+    fn from_path(path: &PathBuf) -> Option<Self> {
+        let dir_iter = fs::read_dir(path);
+        match dir_iter {
+            Ok(iter) => Some(Self {
+                parent: None,
+                iter,
+            }),
+            Err(_) => None,
+        }
+    }
 }
 
 struct DirIter {
-    paths: Vec<PathBuf>
+    current: Box<Dir>,
+    recurse: bool,
+    debug: bool,
 }
 
 impl DirIter {
-    fn new(start: PathBuf) -> Self {
+    fn new(start: PathBuf, recurse: bool, debug: bool) -> Self {
+        let root = Dir::from_root(&start).unwrap();
         Self {
-            paths: vec![start],
+            current: Box::from(root),
+            recurse,
+            debug,
         }
     }
 
-    fn process_path(&mut self, path: PathBuf) -> PathBuf {
-        if path.is_dir() {
-            let paths = fs::read_dir(path).unwrap();
-            self.paths.append(&mut paths.map(|x| {x.unwrap().path()}).collect::<Vec<PathBuf>>());
-            let last = self.paths.pop().unwrap();
-            return self.process_path(last)
-        } else {
-            return path;
+    fn handle_entry(&mut self, entry: DirEntry) -> Option<PathBuf> {
+        let path = entry.path();
+        let metadata = fs::metadata(path.as_path());
+        match metadata {
+            Ok(metadata) => {
+                let ft = metadata.file_type();
+                if ft.is_symlink() {
+                    self.next()
+                } else if ft.is_dir() {
+                    if !self.recurse {
+                        return self.next();
+                    }
+                    self.step_into_and_get_next(path)
+                } else {
+                    Some(path)
+                }
+            },
+            Err(e) => {
+                if self.debug { 
+                    eprintln!("Error at path '{}': {:?}", path.display(), e);
+                }
+                self.next()
+            }
         }
+    }
+
+    fn step_up_and_get_next(&mut self) -> Option<PathBuf> {
+        let parent = std::mem::take(&mut self.current.parent);
+        match parent {
+            Some(parent) => {
+                let dead_dir = std::mem::replace(&mut self.current, parent);
+                // not really sure if this is necessary but just in case
+                drop(dead_dir);
+                self.next()
+            },
+            None => None,
+        }
+    }
+
+    fn step_into_and_get_next(&mut self, path: PathBuf) -> Option<PathBuf> {
+        let new_dir = Dir::from_path(&path);
+        match new_dir {
+            Some(dir) => {
+                let parent = std::mem::replace(&mut self.current, Box::from(dir));
+                self.current.parent = Some(parent);
+            },
+            None => {},
+        };
+        self.next()
     }
 }
 
@@ -125,18 +126,32 @@ impl Iterator for DirIter {
     type Item = PathBuf;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let cur = self.paths.pop();
-        match cur {
-            Some(path) => {
-                Some(self.process_path(path))
+        let entry = self.current.iter.next();
+        match entry {
+            Some(val) => {
+                match val {
+                    Ok(path) => self.handle_entry(path),
+                    Err(_) => self.next(),
+                }
             },
-            None => None,
+            None => {
+                self.step_up_and_get_next()
+            }
         }
     }
 }
 
-fn single_iter(path: PathBuf, regex: &Regex) {
-    let iter = DirIter::new(path);
+fn single_iter(args: Args) {
+    let regex = if args.fixed_string {
+        Regex::new(&regex::escape(&args.pattern)).expect("failed to parse pattern")
+    } else {
+        Regex::new(&args.pattern).expect("failed to parse pattern")
+    };
+
+    // no need to check for directory here, will be handled by iterator
+    let path = Path::new(&args.dir);
+
+    let iter = DirIter::new(path.to_path_buf(), args.recursive, args.debug);
     iter.for_each(|x| {
         let string = x.to_str().unwrap();
         if regex.is_match(string) {
@@ -145,61 +160,8 @@ fn single_iter(path: PathBuf, regex: &Regex) {
     });
 }
 
-fn temp_main() {
-    let args = Args::parse();
-    let regex = if args.fixed_string {
-        Regex::new(&regex::escape(&args.pattern)).expect("failed to parse pattern")
-    } else {
-        Regex::new(&args.pattern).expect("failed to parse pattern")
-    };
-
-    let path = Path::new(&args.dir);
-
-    if !path.is_dir() {
-        panic!("path is not directory");
-    }
-
-    single_iter(path.to_path_buf(), &regex);
-}
-
 fn main() {
-    temp_main();
-    return;
     let args = Args::parse();
-    let regex = if args.fixed_string {
-        Regex::new(&regex::escape(&args.pattern)).expect("failed to parse pattern")
-    } else {
-        Regex::new(&args.pattern).expect("failed to parse pattern")
-    };
 
-    let path = Path::new(&args.dir);
-
-    if !path.is_dir() {
-        panic!("path is not directory");
-    }
-
-    const NUM_ITERS: usize = 10;
-    //println!("running single pass...");
-    let mut before = Instant::now();
-    //for _ in 0..NUM_ITERS {
-        //process_dir_sp(path, &regex, args.recursive).unwrap();
-    //}
-    //let single = before.elapsed() / NUM_ITERS as u32;
-
-    //println!("running multi thread single pass...");
-    //before = Instant::now();
-    //for _ in 0..NUM_ITERS {
-        //process_dir_mt_sp(path, regex.clone());
-    //}
-    //let multi_thread_sp = before.elapsed() / NUM_ITERS as u32;
-
-    println!("running single iter...");
-    //before = Instant::now();
-    for _ in 0..NUM_ITERS {
-        single_iter(path.to_path_buf(), &regex);
-    }
-    let single_iter = before.elapsed() / NUM_ITERS as u32;
-    //println!("single pass: {:.2?}", single);
-    println!("single iter: {:.2?}", single_iter);
-    //println!("multi thread single pass: {:.2?}", multi_thread_sp);
+    single_iter(args);
 }
