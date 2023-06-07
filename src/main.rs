@@ -15,38 +15,28 @@ struct Args {
     #[arg(short, long)]
     recursive: bool,
 
-    #[arg(short, long)]
+    #[arg(long)]
     debug: bool,
 
     #[arg(short = 'j', long, default_value_t = false)]
     multi_thread: bool,
+
+    #[arg(short = 'd', long, default_value_t = 16)]
+    max_depth: usize,
 
     pattern: String,
     dir: String,
 }
 
 struct Dir {
-    parent: Option<Box<Dir>>,
     iter: ReadDir,
 }
 
 impl Dir {
-    fn from_root(path: &PathBuf) -> Option<Self> {
-        let dir_iter = fs::read_dir(path);
-        match dir_iter {
-            Ok(iter) => Some(Self {
-                parent: None,
-                iter,
-            }),
-            Err(_) => None,
-        }
-    }
-
     fn from_path(path: &PathBuf) -> Option<Self> {
         let dir_iter = fs::read_dir(path);
         match dir_iter {
             Ok(iter) => Some(Self {
-                parent: None,
                 iter,
             }),
             Err(_) => None,
@@ -55,18 +45,24 @@ impl Dir {
 }
 
 struct DirIter {
-    current: Box<Dir>,
+    dirs: Vec<Dir>,
     recurse: bool,
     debug: bool,
+    max_depth: usize,
+    depth: usize,
 }
 
 impl DirIter {
-    fn new(start: PathBuf, recurse: bool, debug: bool) -> Self {
-        let root = Dir::from_root(&start).unwrap();
+    fn new(start: PathBuf, recurse: bool, debug: bool, max_depth: usize) -> Self {
+        let root = Dir::from_path(&start).unwrap();
+        let mut dirs = Vec::with_capacity(max_depth);
+        dirs.push(root);
         Self {
-            current: Box::from(root),
+            dirs,
             recurse,
             debug,
+            max_depth,
+            depth: 0,
         }
     }
 
@@ -97,27 +93,24 @@ impl DirIter {
     }
 
     fn step_up_and_get_next(&mut self) -> Option<PathBuf> {
-        let parent = std::mem::take(&mut self.current.parent);
-        match parent {
-            Some(parent) => {
-                let dead_dir = std::mem::replace(&mut self.current, parent);
-                // not really sure if this is necessary but just in case
-                drop(dead_dir);
-                self.next()
-            },
-            None => None,
+        self.dirs.pop();
+        if self.depth > 0 {
+            self.depth -= 1;
         }
+        self.next()
     }
 
     fn step_into_and_get_next(&mut self, path: PathBuf) -> Option<PathBuf> {
-        let new_dir = Dir::from_path(&path);
-        match new_dir {
-            Some(dir) => {
-                let parent = std::mem::replace(&mut self.current, Box::from(dir));
-                self.current.parent = Some(parent);
-            },
-            None => {},
-        };
+        if self.depth + 1 < self.max_depth {
+            let new_dir = Dir::from_path(&path);
+            match new_dir {
+                Some(dir) => {
+                    self.dirs.push(dir);
+                    self.depth += 1;
+                },
+                None => {},
+            };
+        }
         self.next()
     }
 }
@@ -126,7 +119,10 @@ impl Iterator for DirIter {
     type Item = PathBuf;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.current.iter.next();
+        if self.dirs.len() == 0 {
+            return None;
+        }
+        let entry = self.dirs[self.depth].iter.next();
         match entry {
             Some(val) => {
                 match val {
@@ -151,7 +147,7 @@ fn single_iter(args: Args) {
     // no need to check for directory here, will be handled by iterator
     let path = Path::new(&args.dir);
 
-    let iter = DirIter::new(path.to_path_buf(), args.recursive, args.debug);
+    let iter = DirIter::new(path.to_path_buf(), args.recursive, args.debug, args.max_depth);
     iter.for_each(|x| {
         let string = x.to_str().unwrap();
         if regex.is_match(string) {
